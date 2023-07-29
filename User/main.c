@@ -278,7 +278,6 @@ int main(void) {
         if(rx_read_ptr>=RX_BUFFER_LEN) rx_read_ptr=0;
 
 #ifdef  PSG_DEBUG
-        if(ccount!=0) printf("DMA wait:%d\n\r",ccount);
         printf("%02x %02x\n\r",rxdata[0],rxdata[1]);
 #endif
 
@@ -401,6 +400,10 @@ void I2C1_EV_IRQHandler(void) {
 }
 
 void I2C1_ER_IRQHandler(void) {
+
+#ifdef PSG_DEBUG
+    printf("OOPS:");
+#endif
 
     I2C_DeInit(I2C1);
     i2cinit(80000, PSG_ADDRESS);
