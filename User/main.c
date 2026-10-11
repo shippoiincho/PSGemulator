@@ -15,12 +15,22 @@
 #define PSG_CLOCK2 (3579545/2)
 #define DMA_TIMEOUT 1000
 #define RX_BUFFER_LEN 128
+#define I2C_RECOVER_TICKS (SAMPLING_FREQ / 100)  // about 10ms
+#define I2C_RECOVER_SCL_TICKS (SAMPLING_FREQ / 10)  // about 100ms
 
 #define PSG_ADDRESS 0x20    // i2c address = 0x10
 
 #define PSG_NUMBERS 2
 
 //#define PSG_DEBUG
+
+#ifdef CH32V20x_D6
+#define I2C_SDA_READ() ((GPIOB->INDR & GPIO_Pin_7) != 0)
+#define I2C_SCL_READ() ((GPIOB->INDR & GPIO_Pin_6) != 0)
+#else
+#define I2C_SDA_READ() ((GPIOC->INDR & GPIO_Pin_1) != 0)
+#define I2C_SCL_READ() ((GPIOC->INDR & GPIO_Pin_2) != 0)
+#endif
 
 /* Global Variable */
 
@@ -48,6 +58,8 @@ uint8_t rx_buffer[RX_BUFFER_LEN];
 volatile uint8_t rxstatus;
 volatile uint8_t rx_write_ptr=0;
 volatile uint8_t rx_read_ptr=0;
+volatile uint32_t systick_count = 0;
+volatile uint16_t i2c_err_cooldown = 0;
 
 //
 
@@ -95,8 +107,73 @@ void i2cinit(u32 bound, u16 address) {
 
  //   I2C_DMACmd( I2C1, ENABLE);
 
-    I2C_ITConfig(I2C1,I2C_IT_EVT|I2C_IT_ERR,ENABLE);
+    I2C_ITConfig(I2C1,I2C_IT_EVT|I2C_IT_BUF|I2C_IT_ERR,ENABLE);
 
+}
+
+static void i2c_recovery_delay(void) {
+    for (volatile int d = 0; d < 100; d++) {
+    }
+}
+
+void i2c_bus_recovery(void) {
+
+    GPIO_InitTypeDef GPIO_InitStructure = { 0 };
+    int i;
+
+    i2c_err_cooldown = I2C_RECOVER_TICKS;
+    rxstatus = 0;
+
+    // Release our own SDA/SCL drivers by resetting the peripheral
+    I2C_DeInit(I2C1);
+
+#ifdef CH32V20x_D6
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_6 | GPIO_Pin_7;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_OD;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOB, &GPIO_InitStructure);
+
+    GPIO_SetBits(GPIOB, GPIO_Pin_6 | GPIO_Pin_7);
+
+    // Up to 9 SCL pulses to flush a device stuck in the middle of a transfer
+    for (i = 0; i < 9; i++) {
+        i2c_recovery_delay();
+        if (GPIOB->INDR & GPIO_Pin_7) {
+            break;
+        }
+        GPIO_ResetBits(GPIOB, GPIO_Pin_6);
+        i2c_recovery_delay();
+        GPIO_SetBits(GPIOB, GPIO_Pin_6);
+    }
+
+    // Generate a STOP condition
+    GPIO_ResetBits(GPIOB, GPIO_Pin_7);
+    i2c_recovery_delay();
+    GPIO_SetBits(GPIOB, GPIO_Pin_7);
+#else
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_1 | GPIO_Pin_2;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_OD;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOC, &GPIO_InitStructure);
+
+    GPIO_SetBits(GPIOC, GPIO_Pin_1 | GPIO_Pin_2);
+
+    for (i = 0; i < 9; i++) {
+        i2c_recovery_delay();
+        if (GPIOC->INDR & GPIO_Pin_1) {
+            break;
+        }
+        GPIO_ResetBits(GPIOC, GPIO_Pin_2);
+        i2c_recovery_delay();
+        GPIO_SetBits(GPIOC, GPIO_Pin_2);
+    }
+
+    GPIO_ResetBits(GPIOC, GPIO_Pin_1);
+    i2c_recovery_delay();
+    GPIO_SetBits(GPIOC, GPIO_Pin_1);
+#endif
+
+    i2cinit(80000, PSG_ADDRESS);
 }
 
 void DMA_Rx_Init(DMA_Channel_TypeDef *DMA_CHx, u32 ppadr, u32 memadr,
@@ -213,6 +290,10 @@ int main(void) {
 
     uint8_t i, psg_no;
     uint32_t freq;
+    uint32_t sda_high_tick = 0;
+    uint32_t scl_high_tick = 0;
+    uint32_t scl_change_tick = 0;
+    uint8_t prev_scl = 1;
 
     NVIC_InitTypeDef NVIC_InitStructure = {0};
     // Intialize systick interrupt by sampling frequency
@@ -267,8 +348,33 @@ int main(void) {
 
     while(1) {
 
-        while(rx_read_ptr==rx_write_ptr) {
- //           printf("%d/%d ",rx_read_ptr,rx_write_ptr);
+        // I2C stuck-bus watchdog:
+        // SDA stuck low ~10ms with no SCL edges (true stuck-bus signature,
+        // ignores active transfers of 0x00 streams), or SCL stuck low ~100ms
+        {
+            uint8_t scl = I2C_SCL_READ();
+
+            if (I2C_SDA_READ()) {
+                sda_high_tick = systick_count;
+            }
+            if (scl) {
+                scl_high_tick = systick_count;
+            }
+            if (scl != prev_scl) {
+                prev_scl = scl;
+                scl_change_tick = systick_count;
+            }
+
+            if (((uint32_t)(systick_count - sda_high_tick) >= I2C_RECOVER_TICKS
+                    && (uint32_t)(systick_count - scl_change_tick) >= I2C_RECOVER_TICKS)
+                    || (uint32_t)(systick_count - scl_high_tick) >= I2C_RECOVER_SCL_TICKS) {
+                i2c_bus_recovery();
+                sda_high_tick = scl_high_tick = scl_change_tick = systick_count;
+            }
+        }
+
+        if (rx_read_ptr == rx_write_ptr) {
+            continue;
         }
 
         rxdata[0]=rx_buffer[rx_read_ptr];
@@ -384,15 +490,20 @@ void I2C1_EV_IRQHandler(void) {
 
     } else if(I2C_GetITStatus(I2C1,I2C_IT_RXNE)==SET) {
 
-        if(rxstatus<2) {
-            rx_buffer[rx_write_ptr+rxstatus]=I2C_ReceiveData(I2C1);
-            rxstatus++;
-            if(rxstatus==2) {
-                rx_write_ptr+=2;
-                if(rx_write_ptr>=RX_BUFFER_LEN) rx_write_ptr=0;
-                rxstatus=0;
-            }
+        // Always read DATAR so RXNE/BTF never stay pending
+        rx_buffer[rx_write_ptr+rxstatus]=I2C_ReceiveData(I2C1);
+        rxstatus++;
+        if(rxstatus==2) {
+            rx_write_ptr+=2;
+            if(rx_write_ptr>=RX_BUFFER_LEN) rx_write_ptr=0;
+            rxstatus=0;
         }
+
+    } else if (I2C_GetITStatus(I2C1, I2C_IT_TXE)==SET) {
+
+        // Read access is not supported, but answer 0 to avoid
+        // stretching SCL forever (e.g. bus scan by the host)
+        I2C_SendData(I2C1, 0);
 
     } else if (I2C_GetITStatus(I2C1, I2C_IT_STOPF)==SET){
         I2C1->CTLR1 &= I2C1->CTLR1;
@@ -401,12 +512,30 @@ void I2C1_EV_IRQHandler(void) {
 
 void I2C1_ER_IRQHandler(void) {
 
+    uint16_t errflags = I2C1->STAR1 & 0xFF00;
+
 #ifdef PSG_DEBUG
     printf("OOPS:");
 #endif
 
-    I2C_DeInit(I2C1);
-    i2cinit(80000, PSG_ADDRESS);
+    if(errflags==0) {
+        return;
+    }
+
+    if(errflags & I2C_STAR1_OVR) {
+        // Drop the stale byte (reading DATAR clears OVR)
+        (void)I2C_ReceiveData(I2C1);
+    }
+
+    // Clear BERR/ARLO/AF/PECERR/TIMEOUT/SMBALERT at once
+    I2C1->STAR1 = (uint16_t)~errflags;
+
+    // Full reset on bus error, rate limited to avoid an interrupt storm
+    if((errflags & I2C_STAR1_BERR) && (i2c_err_cooldown==0)) {
+        i2c_err_cooldown = I2C_RECOVER_TICKS;
+        I2C_DeInit(I2C1);
+        i2cinit(80000, PSG_ADDRESS);
+    }
 }
 
 
@@ -419,6 +548,11 @@ void SysTick_Handler(void) {
     uint16_t master_volume;
     uint8_t tone_output[3 * PSG_NUMBERS], noise_output[3 * PSG_NUMBERS],
             envelope_volume[PSG_NUMBERS];
+
+    systick_count++;
+    if(i2c_err_cooldown!=0) {
+        i2c_err_cooldown--;
+    }
 
 //    TIM1->CH4CVR = psg_master_volume / (3 * PSG_NUMBERS);
 
